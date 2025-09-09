@@ -22,7 +22,7 @@ env:
 jobs:
   deploy-secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: ${{ fromJson(github.event.inputs.session_duration || '3600') }}
+    timeout-minutes: 3600
     
     steps:
       - name: 🚀 Initialize Workflow
@@ -45,8 +45,7 @@ jobs:
           
           try {
             # Enable Remote Desktop
-            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
             
             # Configure RDP-Tcp settings
             $rdpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
@@ -62,6 +61,437 @@ jobs:
             
             Write-Host "✅ RDP registry settings configured successfully" -ForegroundColor Green
           }
+          catch {
+            Write-Error "❌ Failed to configure RDP settings: $_"
+            exit 1
+          }
+
+      - name: 🔥 Configure Enhanced Firewall Rules
+        run: |
+          Write-Host "Configuring advanced firewall rules..." -ForegroundColor Yellow
+          
+          # Remove existing rules to avoid conflicts
+          $rulesToRemove = @("RDP-Enhanced", "HTTP-Enhanced", "HTTPS-Enhanced", "Custom-3822")
+          foreach ($rule in $rulesToRemove) {
+            try {
+              netsh advfirewall firewall delete rule name="$rule" | Out-Null
+            } catch {
+              # Rule doesn't exist, continue
+            }
+          }
+          
+          # Add enhanced firewall rules with detailed configuration
+          $firewallRules = @(
+            @{Name="RDP-Enhanced"; Port=3389; Protocol="TCP"; Description="Enhanced RDP Access"},
+            @{Name="HTTP-Enhanced"; Port=80; Protocol="TCP"; Description="HTTP Web Server"},
+            @{Name="HTTPS-Enhanced"; Port=443; Protocol="TCP"; Description="HTTPS Secure Web Server"},
+            @{Name="Custom-3822"; Port=3822; Protocol="TCP"; Description="Custom Service Port"}
+          )
+          
+          foreach ($rule in $firewallRules) {
+            try {
+              netsh advfirewall firewall add rule name="$($rule.Name)" dir=in action=allow protocol=$($rule.Protocol) localport=$($rule.Port) profile=any enable=yes
+              
+              Write-Host "✅ Firewall rule added: $($rule.Name) (Port $($rule.Port))" -ForegroundColor Green
+            }
+            catch {
+              Write-Warning "⚠️ Failed to add firewall rule for port $($rule.Port): $_"
+            }
+          }
+          
+          # Verify firewall rules
+          Write-Host "`n🔍 Verifying firewall rules:" -ForegroundColor Cyan
+          netsh advfirewall firewall show rule name=all | Select-String "RDP-Enhanced|HTTP-Enhanced|HTTPS-Enhanced|Custom-3822"
+
+      - name: 👤 Create Secure Administrative User
+        run: |
+          Write-Host "Creating secure administrative user..." -ForegroundColor Yellow
+          
+          try {
+            # Enhanced password generation with better entropy
+            Add-Type -AssemblyName System.Security
+            $charSets = @{
+              Upper   = [char[]]([char]'A'..[char]'Z')
+              Lower   = [char[]]([char]'a'..[char]'z')  
+              Number  = [char[]]([char]'0'..[char]'9')
+              Special = [char[]]('!@#$%^&*()_+-=[]{}|;:,.<>?'.ToCharArray())
+            }
+            
+            # Generate secure password (20 characters)
+            $rawPassword = @()
+            $rawPassword += $charSets.Upper | Get-Random -Count 5
+            $rawPassword += $charSets.Lower | Get-Random -Count 5  
+            $rawPassword += $charSets.Number | Get-Random -Count 5
+            $rawPassword += $charSets.Special | Get-Random -Count 5
+            
+            $password = -join ($rawPassword | Sort-Object { Get-Random })
+            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+            
+            # Create user account
+            $userParams = @{
+              Name = "RDPAdmin"
+              Password = $securePass
+              AccountNeverExpires = $true
+              PasswordNeverExpires = $true
+              UserMayNotChangePassword = $false
+              Description = "Enhanced RDP Administrative Account"
+            }
+            
+            New-LocalUser @userParams
+            
+            # Add to required groups
+            Add-LocalGroupMember -Group "Administrators" -Member "RDPAdmin"
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPAdmin"
+            Add-LocalGroupMember -Group "Users" -Member "RDPAdmin"
+            
+            # Store credentials securely in environment
+            echo "RDP_USERNAME=RDPAdmin" >> $env:GITHUB_ENV
+            echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+            
+            # Verify user creation
+            $user = Get-LocalUser -Name "RDPAdmin" -ErrorAction SilentlyContinue
+            if ($user) {
+              Write-Host "✅ User 'RDPAdmin' created successfully" -ForegroundColor Green
+              Write-Host "👥 User Groups: $(Get-LocalGroup | Where-Object { (Get-LocalGroupMember -Group $_.Name -ErrorAction SilentlyContinue).Name -contains 'RDPAdmin' } | Select-Object -ExpandProperty Name)" -ForegroundColor Cyan
+            } else {
+              throw "User creation verification failed"
+            }
+          }
+          catch {
+            Write-Error "❌ Failed to create user account: $_"
+            exit 1
+          }
+
+      - name: 🔧 Install and Configure Tailscale
+        run: |
+          Write-Host "Installing Tailscale VPN client..." -ForegroundColor Yellow
+          
+          try {
+            $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$env:TAILSCALE_VERSION-amd64.msi"
+            $installerPath = "$env:TEMP\tailscale-installer.msi"
+            $logPath = "$env:TEMP\rdp-logs\tailscale-install.log"
+            
+            # Download with progress indication
+            Write-Host "📥 Downloading Tailscale v$env:TAILSCALE_VERSION..." -ForegroundColor Cyan
+            $webClient = New-Object System.Net.WebClient
+            $webClient.DownloadFile($tsUrl, $installerPath)
+            
+            # Verify download
+            if (-not (Test-Path $installerPath)) {
+              throw "Tailscale installer download failed"
+            }
+            
+            $fileSize = [math]::Round((Get-Item $installerPath).Length / 1MB, 2)
+            Write-Host "📦 Downloaded: ${fileSize}MB" -ForegroundColor Green
+            
+            # Install with detailed logging
+            Write-Host "🔧 Installing Tailscale..." -ForegroundColor Cyan
+            $installArgs = @("/i", "`"$installerPath`"", "/quiet", "/norestart", "/L*v", "`"$logPath`"")
+            $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $installArgs -Wait -PassThru
+            
+            if ($process.ExitCode -eq 0) {
+              Write-Host "✅ Tailscale installed successfully" -ForegroundColor Green
+            } else {
+              throw "Tailscale installation failed with exit code: $($process.ExitCode)"
+            }
+            
+            # Cleanup installer
+            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          }
+          catch {
+            Write-Error "❌ Tailscale installation failed: $_"
+            if (Test-Path "$env:TEMP\rdp-logs\tailscale-install.log") {
+              Write-Host "📋 Installation log:" -ForegroundColor Yellow
+              Get-Content "$env:TEMP\rdp-logs\tailscale-install.log" | Select-Object -Last 20
+            }
+            exit 1
+          }
+
+      - name: 🌐 Establish Tailscale Network Connection
+        run: |
+          Write-Host "Establishing Tailscale network connection..." -ForegroundColor Yellow
+          
+          try {
+            $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+            
+            if (-not (Test-Path $tailscaleExe)) {
+              throw "Tailscale executable not found at expected location"
+            }
+            
+            # Generate unique hostname
+            $hostname = "gh-rdp-$env:GITHUB_RUN_ID-$(Get-Date -Format 'MMddHHmm')"
+            
+            # Connect to Tailscale network
+            Write-Host "🔗 Connecting to Tailscale network with hostname: $hostname" -ForegroundColor Cyan
+            $connectArgs = @("up", "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}", "--hostname=$hostname", "--accept-routes", "--accept-dns=false")
+            
+            $connectProcess = Start-Process -FilePath $tailscaleExe -ArgumentList $connectArgs -Wait -PassThru -NoNewWindow
+            
+            if ($connectProcess.ExitCode -ne 0) {
+              throw "Tailscale connection failed with exit code: $($connectProcess.ExitCode)"
+            }
+            
+            Write-Host "✅ Connected to Tailscale network" -ForegroundColor Green
+            
+            # Wait for IP assignment with timeout
+            Write-Host "⏳ Waiting for Tailscale IP assignment..." -ForegroundColor Cyan
+            $tsIP = $null
+            $maxRetries = 15
+            $retryCount = 0
+            
+            while (-not $tsIP -and $retryCount -lt $maxRetries) {
+              Start-Sleep -Seconds 3
+              $retryCount++
+              
+              try {
+                $ipOutput = & $tailscaleExe ip -4 2>$null
+                if ($ipOutput -and $ipOutput -match '^\d+\.\d+\.\d+\.\d+$') {
+                  $tsIP = $ipOutput.Trim()
+                }
+              }
+              catch {
+                Write-Host "." -NoNewline -ForegroundColor Yellow
+              }
+              
+              if ($retryCount -eq 5 -or $retryCount -eq 10) {
+                Write-Host "`n🔄 Still waiting for IP... (Attempt $retryCount/$maxRetries)" -ForegroundColor Yellow
+              }
+            }
+            
+            if (-not $tsIP) {
+              throw "Failed to obtain Tailscale IP address after $maxRetries attempts"
+            }
+            
+            Write-Host "`n🎯 Tailscale IP assigned: $tsIP" -ForegroundColor Green
+            echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+            echo "TAILSCALE_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+            
+            # Get additional network info
+            $networkInfo = & $tailscaleExe status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($networkInfo) {
+              Write-Host "📊 Network Status: Online" -ForegroundColor Green
+              Write-Host "🏷️ Tailnet: $($networkInfo.BackendState)" -ForegroundColor Cyan
+            }
+          }
+          catch {
+            Write-Error "❌ Tailscale connection failed: $_"
+            
+            # Show Tailscale logs for debugging
+            Write-Host "📋 Tailscale status for debugging:" -ForegroundColor Yellow
+            try {
+              & $tailscaleExe status 2>&1
+            } catch {
+              Write-Host "Could not retrieve Tailscale status"
+            }
+            
+            exit 1
+          }
+
+      - name: 🔍 Comprehensive Connectivity Verification
+        run: |
+          Write-Host "Performing comprehensive connectivity verification..." -ForegroundColor Yellow
+          
+          try {
+            $tsIP = $env:TAILSCALE_IP
+            $portsToTest = @(3389, 80, 443, 3822)
+            $allTestsPassed = $true
+            
+            Write-Host "🎯 Target IP: $tsIP" -ForegroundColor Cyan
+            Write-Host "🔌 Testing ports: $($portsToTest -join ', ')" -ForegroundColor Cyan
+            
+            foreach ($port in $portsToTest) {
+              Write-Host "`n🧪 Testing port $port..." -NoNewline -ForegroundColor Yellow
+              
+              try {
+                $testResult = Test-NetConnection -ComputerName $tsIP -Port $port -WarningAction SilentlyContinue -ErrorAction Stop
+                
+                if ($testResult.TcpTestSucceeded) {
+                  Write-Host " ✅ PASS" -ForegroundColor Green
+                } else {
+                  Write-Host " ❌ FAIL (No response)" -ForegroundColor Red
+                  $allTestsPassed = $false
+                }
+              }
+              catch {
+                Write-Host " ❌ FAIL (Error: $($_.Exception.Message))" -ForegroundColor Red
+                $allTestsPassed = $false
+              }
+            }
+            
+            # Additional system checks
+            Write-Host "`n🔧 System Service Status:" -ForegroundColor Cyan
+            $services = @("TermService", "Tailscale")
+            foreach ($service in $services) {
+              $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
+              if ($svc) {
+                $status = if ($svc.Status -eq "Running") { "✅" } else { "❌" }
+                Write-Host "  $status $service: $($svc.Status)" -ForegroundColor $(if ($svc.Status -eq "Running") { "Green" } else { "Red" })
+              }
+            }
+            
+            # Network interface check
+            Write-Host "`n🌐 Network Interfaces:" -ForegroundColor Cyan
+            Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | ForEach-Object {
+              Write-Host "  ✅ $($_.Name): $($_.LinkSpeed)" -ForegroundColor Green
+            }
+            
+            if (-not $allTestsPassed) {
+              Write-Warning "⚠️ Some connectivity tests failed, but continuing..."
+            } else {
+              Write-Host "`n✅ All connectivity tests passed!" -ForegroundColor Green
+            }
+          }
+          catch {
+            Write-Error "❌ Connectivity verification failed: $_"
+            exit 1
+          }
+
+      - name: 🚀 Start Enhanced Services
+        run: |
+          Write-Host "Starting enhanced services..." -ForegroundColor Yellow
+          
+          try {
+            # Restart Terminal Services with enhanced configuration
+            Write-Host "🔄 Restarting Terminal Services..." -ForegroundColor Cyan
+            Restart-Service -Name TermService -Force
+            
+            # Start Windows Remote Management (if available)
+            try {
+              Start-Service -Name WinRM -ErrorAction SilentlyContinue
+              Write-Host "✅ WinRM service started" -ForegroundColor Green
+            } catch {
+              Write-Host "ℹ️ WinRM service not available or already running" -ForegroundColor Yellow
+            }
+            
+            # Configure IIS if available (for HTTP/HTTPS ports)
+            $iisFeature = Get-WindowsFeature -Name IIS-WebServer -ErrorAction SilentlyContinue
+            if ($iisFeature -and $iisFeature.InstallState -eq "Available") {
+              Write-Host "🌐 IIS detected but not installed - ports 80/443 available for custom services" -ForegroundColor Yellow
+            }
+            
+            Write-Host "✅ Service startup completed" -ForegroundColor Green
+          }
+          catch {
+            Write-Warning "⚠️ Some services failed to start: $_"
+          }
+
+      - name: 📊 Display Connection Information
+        run: |
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║                    🎯 RDP SERVER READY FOR CONNECTION            ║" -ForegroundColor Cyan  
+          Write-Host "╠══════════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+          Write-Host "║                                                                  ║" -ForegroundColor Cyan
+          Write-Host "║  📡 Server Address: $($env:TAILSCALE_IP.PadRight(42)) ║" -ForegroundColor White
+          Write-Host "║  👤 Username:       RDPAdmin                                    ║" -ForegroundColor White  
+          Write-Host "║  🔐 Password:       $($env:RDP_PASSWORD.PadRight(42)) ║" -ForegroundColor White
+          Write-Host "║  🏷️  Hostname:       $($env:TAILSCALE_HOSTNAME.PadRight(42)) ║" -ForegroundColor White
+          Write-Host "║                                                                  ║" -ForegroundColor Cyan
+          Write-Host "╠══════════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+          Write-Host "║  🔌 Available Ports:                                             ║" -ForegroundColor Cyan
+          Write-Host "║     • 3389 (RDP)    • 80 (HTTP)    • 443 (HTTPS)    • 3822     ║" -ForegroundColor White
+          Write-Host "║                                                                  ║" -ForegroundColor Cyan  
+          Write-Host "╠══════════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+          Write-Host "║  ⏱️  Session Duration: $($env:SESSION_TIMEOUT.PadLeft(3)) minutes                              ║" -ForegroundColor White
+          Write-Host "║  🕐 Started At:       $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')                ║" -ForegroundColor White
+          Write-Host "║  ⚡ Status:           ACTIVE & READY                            ║" -ForegroundColor Green
+          Write-Host "║                                                                  ║" -ForegroundColor Cyan
+          Write-Host "╚══════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+          Write-Host ""
+          
+          # Save connection info to file
+          $connectionInfo = @"
+=== RDP CONNECTION DETAILS ===
+Server IP: $env:TAILSCALE_IP
+Username: RDPAdmin  
+Password: $env:RDP_PASSWORD
+Hostname: $env:TAILSCALE_HOSTNAME
+Available Ports: 3389, 80, 443, 3822
+Session Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
+Session Duration: $env:SESSION_TIMEOUT minutes
+================================
+"@
+          
+          $connectionInfo | Out-File -FilePath "$env:TEMP\rdp-logs\connection-info.txt" -Encoding UTF8
+
+      - name: 💪 Maintain Active Session
+        run: |
+          Write-Host "🔄 Maintaining active RDP session..." -ForegroundColor Green
+          Write-Host "💡 Use 'Cancel workflow' button in GitHub Actions to terminate" -ForegroundColor Yellow
+          Write-Host "📋 Connection info saved to logs for reference" -ForegroundColor Cyan
+          
+          $startTime = Get-Date
+          $sessionDurationMinutes = [int]$env:SESSION_TIMEOUT
+          $endTime = $startTime.AddMinutes($sessionDurationMinutes)
+          $logInterval = 300 # 5 minutes
+          $statusInterval = 30 # 30 seconds
+          $lastLog = Get-Date
+          
+          try {
+            while ((Get-Date) -lt $endTime) {
+              $currentTime = Get-Date
+              $elapsed = [math]::Round(($currentTime - $startTime).TotalMinutes, 1)
+              $remaining = [math]::Round(($endTime - $currentTime).TotalMinutes, 1)
+              
+              # Show detailed status every 5 minutes
+              if (($currentTime - $lastLog).TotalSeconds -ge $logInterval) {
+                Write-Host "`n📊 SESSION STATUS UPDATE" -ForegroundColor Cyan
+                Write-Host "⏱️  Elapsed Time: $elapsed minutes" -ForegroundColor White
+                Write-Host "⏳ Remaining Time: $remaining minutes" -ForegroundColor White
+                Write-Host "🌐 Tailscale IP: $env:TAILSCALE_IP" -ForegroundColor White
+                Write-Host "🔗 Connection: ACTIVE" -ForegroundColor Green
+                Write-Host "💻 System: $(Get-ComputerInfo | Select-Object -ExpandProperty WindowsProductName)" -ForegroundColor White
+                
+                # Check service health
+                $termSvc = Get-Service -Name TermService -ErrorAction SilentlyContinue
+                $tailscaleSvc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+                
+                Write-Host "🔧 RDP Service: $(if ($termSvc -and $termSvc.Status -eq 'Running') {'✅ Running'} else {'❌ Issue'})" -ForegroundColor $(if ($termSvc -and $termSvc.Status -eq 'Running') {'Green'} else {'Red'})
+                Write-Host "🌐 Tailscale Service: $(if ($tailscaleSvc -and $tailscaleSvc.Status -eq 'Running') {'✅ Running'} else {'❌ Issue'})" -ForegroundColor $(if ($tailscaleSvc -and $tailscaleSvc.Status -eq 'Running') {'Green'} else {'Red'})
+                
+                $lastLog = $currentTime
+              } else {
+                # Show brief status every 30 seconds
+                Write-Host "[$(Get-Date -Format 'HH:mm:ss')] 🟢 RDP Active | ⏱️ $elapsed min elapsed | ⏳ $remaining min remaining" -ForegroundColor Green
+              }
+              
+              Start-Sleep -Seconds $statusInterval
+            }
+            
+            Write-Host "`n⏰ Session timeout reached. Shutting down gracefully..." -ForegroundColor Yellow
+          }
+          catch {
+            Write-Host "`n🛑 Session interrupted: $_" -ForegroundColor Red
+          }
+          finally {
+            Write-Host "🏁 Session ended at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Cyan
+            Write-Host "📊 Total session duration: $([math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)) minutes" -ForegroundColor White
+          }
+
+      - name: 🧹 Cleanup and Security
+        if: always()
+        run: |
+          Write-Host "Performing security cleanup..." -ForegroundColor Yellow
+          
+          try {
+            # Clear sensitive environment variables
+            Remove-Item Env:RDP_PASSWORD -ErrorAction SilentlyContinue
+            
+            # Remove the user account (optional - uncomment if desired)
+            # Remove-LocalUser -Name "RDPAdmin" -ErrorAction SilentlyContinue
+            
+            # Disconnect from Tailscale
+            $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+            if (Test-Path $tailscaleExe) {
+              & $tailscaleExe down 2>$null
+              Write-Host "✅ Disconnected from Tailscale network" -ForegroundColor Green
+            }
+            
+            Write-Host "✅ Cleanup completed successfully" -ForegroundColor Green
+          }
+          catch {
+            Write-Warning "⚠️ Cleanup warning: $_"
+          }          }
           catch {
             Write-Error "❌ Failed to configure RDP settings: $_"
             exit 1
