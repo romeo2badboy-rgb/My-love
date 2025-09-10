@@ -85,6 +85,220 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
+          # Validate Tailscale auth key first
+          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          if ([string]::IsNullOrEmpty($authKey) -or $authKey -eq "" -or $authKey.Length -lt 20) {
+              Write-Host "❌ TAILSCALE_AUTH_KEY is missing or invalid!"
+              Write-Host ""
+              Write-Host "🔧 How to fix this:"
+              Write-Host "1. Go to Tailscale Admin Console: https://login.tailscale.com/admin/settings/keys"
+              Write-Host "2. Generate a new Auth Key with these settings:"
+              Write-Host "   - Reusable: ✅ Enabled"
+              Write-Host "   - Ephemeral: ✅ Enabled (recommended for temporary servers)"
+              Write-Host "   - Preauthorized: ✅ Enabled"
+              Write-Host "   - Tags: Optional (e.g., tag:github-actions)"
+              Write-Host "3. Copy the generated key (starts with 'tskey-auth-')"
+              Write-Host "4. In GitHub repo: Settings > Secrets and variables > Actions"
+              Write-Host "5. Create new secret: Name=TAILSCALE_AUTH_KEY, Value=your_key"
+              Write-Host ""
+              Write-Host "⚠️ Auth key format should be: tskey-auth-xxxxxxxxxxxxxxxxx"
+              Write-Host "❌ Current key: $($authKey.Substring(0, [Math]::Min(10, $authKey.Length)))..."
+              exit 1
+          }
+          
+          # Connect to Tailscale with unique hostname
+          $hostname = "enhanced-rdp-$env:GITHUB_RUN_ID"
+          Write-Host "🔗 Connecting to Tailscale with hostname: $hostname"
+          Write-Host "🔑 Using auth key: $($authKey.Substring(0, 15))..."
+          
+          try {
+              $connectResult = & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="$authKey" --hostname="$hostname" --accept-routes 2>&1
+              
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "❌ Tailscale connection failed with exit code: $LASTEXITCODE"
+                  Write-Host "Error output: $connectResult"
+                  
+                  if ($connectResult -match "invalid key|not valid|expired") {
+                      Write-Host ""
+                      Write-Host "🔧 Auth Key Issues - Possible solutions:"
+                      Write-Host "1. Key expired - Generate a new one"
+                      Write-Host "2. Key already used (if not reusable) - Generate new reusable key"
+                      Write-Host "3. Key format wrong - Should start with 'tskey-auth-'"
+                      Write-Host "4. Key has restricted permissions - Check key settings"
+                  }
+                  exit 1
+              }
+              
+              Write-Host "✅ Successfully connected to Tailscale network"
+          } catch {
+              Write-Host "❌ Connection error: $_"
+              exit 1
+          }
+          
+          # Wait for IP assignment with better retry logic
+          $tsIP = $null
+          $retries = 0
+          $maxRetries = 20
+          
+          Write-Host "⏳ Waiting for Tailscale IP assignment..."
+          while (-not $tsIP -and $retries -lt $maxRetries) {
+              try {
+                  $ipOutput = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+                  if ($ipOutput -and $ipOutput -match '^\d+\.\d+\.\d+\.\d+$') {
+                      $tsIP = $ipOutput.Trim()
+                      break
+                  }
+              } catch {
+                  Write-Host "." -NoNewline
+              }
+              
+              Start-Sleep -Seconds 3
+              $retries++
+              
+              if ($retries -eq 5) { Write-Host "`n🔄 Still waiting for IP assignment..." }
+              if ($retries -eq 10) { Write-Host "🔄 This might take a moment..." }
+              if ($retries -eq 15) { 
+                  Write-Host "🔄 Checking Tailscale status..."
+                  try {
+                      & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+                  } catch {
+                      Write-Host "Could not get status"
+                  }
+              }
+          }
+          
+          if (-not $tsIP) {
+              Write-Host "❌ Tailscale IP not assigned after $maxRetries attempts"
+              Write-Host "🔧 Debugging info:"
+              try {
+                  Write-Host "Tailscale Status:"
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>&1
+                  Write-Host "Network interfaces:"
+                  Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object Name, LinkSpeed
+              } catch {
+                  Write-Host "Could not retrieve debug info"
+              }
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          echo "TAILSCALE_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+          Write-Host "🎯 Tailscale IP assigned: $tsIP"
+
+      - name: Verify Enhanced Connectivity
+        run: |
+          $tsIP = $env:TAILSCALE_IP
+          $portsToTest = @(3389, 80, 443, 3822)
+          
+          Write-Host "Testing connectivity to $tsIP"
+          Write-Host "Testing ports: $($portsToTest -join ', ')"
+          
+          foreach ($port in $portsToTest) {
+              Write-Host "Testing port $port..." -NoNewline
+              try {
+                  $testResult = Test-NetConnection -ComputerName $tsIP -Port $port -WarningAction SilentlyContinue
+                  if ($testResult.TcpTestSucceeded) {
+                      Write-Host " SUCCESS" -ForegroundColor Green
+                  } else {
+                      Write-Host " FAILED" -ForegroundColor Yellow
+                  }
+              } catch {
+                  Write-Host " ERROR" -ForegroundColor Red
+              }
+          }
+          
+          # Verify core services
+          $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+          $tailscaleService = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+          
+          Write-Host "RDP Service: $(if ($rdpService.Status -eq 'Running') {'Running'} else {'Not Running'})"
+          Write-Host "Tailscale Service: $(if ($tailscaleService.Status -eq 'Running') {'Running'} else {'Not Running'})"
+
+      - name: Display Enhanced Connection Info
+        run: |
+          Write-Host ""
+          Write-Host "==============================================="
+          Write-Host "         ENHANCED RDP SERVER READY"
+          Write-Host "==============================================="
+          Write-Host ""
+          Write-Host "Server Address: $env:TAILSCALE_IP"
+          Write-Host "Username:       RDPAdmin"
+          Write-Host "Password:       $env:RDP_PASSWORD"
+          Write-Host "Hostname:       $env:TAILSCALE_HOSTNAME"
+          Write-Host ""
+          Write-Host "Available Ports:"
+          Write-Host "  - 3389 (RDP)"
+          Write-Host "  - 80   (HTTP)"
+          Write-Host "  - 443  (HTTPS)"
+          Write-Host "  - 3822 (Custom)"
+          Write-Host ""
+          Write-Host "Session Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+          Write-Host "Max Duration: 60 hours"
+          Write-Host ""
+          Write-Host "==============================================="
+
+      - name: Maintain Enhanced Session
+        run: |
+          Write-Host "Enhanced RDP session is now active!"
+          Write-Host "Use 'Cancel workflow' in GitHub Actions to terminate"
+          Write-Host ""
+          
+          $startTime = Get-Date
+          $logInterval = 300  # 5 minutes
+          $statusInterval = 60  # 1 minute
+          $lastDetailedLog = Get-Date
+          
+          while ($true) {
+              $currentTime = Get-Date
+              $elapsed = [math]::Round(($currentTime - $startTime).TotalMinutes, 1)
+              
+              # Show detailed status every 5 minutes
+              if (($currentTime - $lastDetailedLog).TotalSeconds -ge $logInterval) {
+                  Write-Host ""
+                  Write-Host "=== SESSION STATUS UPDATE ==="
+                  Write-Host "Elapsed Time: $elapsed minutes"
+                  Write-Host "Server IP: $env:TAILSCALE_IP"
+                  Write-Host "Status: ACTIVE"
+                  Write-Host "Time: $(Get-Date -Format 'HH:mm:ss')"
+                  
+                  # Quick service check
+                  $rdpSvc = Get-Service -Name TermService -ErrorAction SilentlyContinue
+                  $tsSvc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+                  Write-Host "RDP Service: $(if ($rdpSvc.Status -eq 'Running') {'OK'} else {'ISSUE'})"
+                  Write-Host "Tailscale: $(if ($tsSvc.Status -eq 'Running') {'OK'} else {'ISSUE'})"
+                  Write-Host "============================="
+                  
+                  $lastDetailedLog = $currentTime
+              } else {
+                  # Brief status update
+                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Enhanced RDP Active | $elapsed min elapsed | Server: $env:TAILSCALE_IP"
+              }
+              
+              Start-Sleep -Seconds $statusInterval
+          }          
+          # Verify user creation
+          if (-not (Get-LocalUser -Name "RDPAdmin")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+          Write-Host "Enhanced user 'RDPAdmin' created successfully"
+
+      - name: Install Tailscale
+        run: |
+          # Download and install Tailscale
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Write-Host "Downloading Tailscale..."
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          
+          Write-Host "Installing Tailscale..."
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed successfully"
+
+      - name: Establish Tailscale Connection
+        run: |
           # Connect to Tailscale with unique hostname
           $hostname = "enhanced-rdp-$env:GITHUB_RUN_ID"
           Write-Host "Connecting to Tailscale with hostname: $hostname"
