@@ -8,20 +8,19 @@ jobs:
     timeout-minutes: 3600
 
     env:
-      # Ports we will open + verify
       PORTS: "3389,3822,80,443"
       TAILSCALE_MSI_URL: "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
       RDP_USERNAME: "RDP"
 
     steps:
       - name: Prepare - show env
-        run: echo "Preparing to open ports: $env:PORTS"
         shell: pwsh
+        run: echo "Preparing to open ports: $env:PORTS"
 
       - name: Configure RDP, Services & Firewall (robust)
         shell: pwsh
         run: |
-          $enableNLA = $env:ENABLE_NLA -eq "true"  # optional secret ENABLE_NLA=true to enable NLA
+          $enableNLA = $env:ENABLE_NLA -eq "true"
           Write-Host "Enable NLA? $enableNLA"
 
           # Enable Remote Desktop (allow connections)
@@ -29,24 +28,19 @@ jobs:
 
           if ($enableNLA) {
             Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
-            # keep SecurityLayer default (0 = RDP, 1 = Negotiate, 2 = SSL)
           } else {
-            # Disable NLA to maximize compatibility with simple RDP clients
             Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
             Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           }
 
-          # Ensure TermService is set to Automatic and running
           Set-Service -Name TermService -StartupType Automatic
           Start-Service -Name TermService -ErrorAction SilentlyContinue
 
-          # Firewall rules: remove old named rules then add robust rules on all profiles
           $ruleBase = "GH-RDPon-Rule"
           Get-NetFirewallRule -DisplayName "$ruleBase-*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 
           $ports = $env:PORTS.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
           foreach ($p in $ports) {
-            # Add both TCP allow and ensure applied to All profiles (Domain,Private,Public)
             if (-not (Get-NetFirewallRule -DisplayName "$ruleBase-$p" -ErrorAction SilentlyContinue)) {
               New-NetFirewallRule -DisplayName "$ruleBase-$p" -Direction Inbound -LocalPort $p -Protocol TCP -Action Allow -Profile Any -Enabled True
             } else {
@@ -54,7 +48,6 @@ jobs:
             }
           }
 
-          # Diagnostics dump
           Write-Host "=== LISTENERS (netstat) ==="
           netstat -an | Select-String ":3389|:3822|:80|:443" | ForEach-Object { Write-Host $_ }
 
@@ -79,7 +72,6 @@ jobs:
           $raw += $charSet.Special | Get-Random -Count 4
           $password = -join ($raw | Sort-Object { Get-Random })
 
-          # Mask the password in Actions logs
           Write-Host "::add-mask::$password"
 
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
@@ -92,11 +84,9 @@ jobs:
             New-LocalUser -Name $env:RDP_USERNAME -Password $securePass -AccountNeverExpires -UserMayNotChangePassword:$false
           }
 
-          # Add to needed groups
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
 
-          # Export creds to GITHUB_ENV for later steps (masked)
           echo "RDP_USER=$env:RDP_USERNAME" >> $env:GITHUB_ENV
           echo "RDP_PASS=$password" >> $env:GITHUB_ENV
 
@@ -124,15 +114,12 @@ jobs:
           $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
           if (-not (Test-Path $exe)) { Write-Error "Tailscale executable not found at $exe"; exit 1 }
 
-          # Up with authkey and unique hostname
           & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes --accept-dns=false
 
-          # robust wait for IPv4 address
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 20) {
             $ipsRaw = & $exe ip -4 2>$null
-            # take first non-empty line and first token
             $ips = ($ipsRaw -split "\r?\n" | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' })
             if ($ips.Count -gt 0) {
               $tsIP = ($ips[0] -split '\s+')[0].Trim()
@@ -158,7 +145,6 @@ jobs:
           $ports = $env:PORTS.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
           $allGood = $true
 
-          # 1) Check local listen on 3389 specifically
           $listen = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
           if ($null -eq $listen) {
             Write-Warning "RDP service is not listening on local port 3389. Attempting to restart TermService and re-check..."
@@ -175,13 +161,11 @@ jobs:
             Write-Host "Local RDP listener OK."
           }
 
-          # 2) From runner -> Tailscale IP check each port (TCP)
           $remote = $env:TAILSCALE_IP
           if (-not $remote) { Write-Error "No Tailscale IP set"; exit 1 }
 
           foreach ($p in $ports) {
             $ok = $false
-            # run Test-NetConnection with timeout attempts
             for ($i=0; $i -lt 6; $i++) {
               $t = Test-NetConnection -ComputerName $remote -Port $p -InformationLevel Detailed -WarningAction SilentlyContinue
               if ($t.TcpTestSucceeded) { $ok = $true; break }
@@ -196,8 +180,7 @@ jobs:
           }
 
           if (-not $allGood) {
-            Write-Error "One or more checks failed. See logs above for diagnostics. Exiting with failure to avoid exposing a broken endpoint."
-            # Provide quick diagnostics
+            Write-Error "One or more checks failed. See logs above for diagnostics. Exiting with failure."
             Write-Host "`n--- DIAGNOSTICS ---"
             Write-Host "Local netstat:"
             netstat -an | Select-String ":3389|:3822|:80|:443" | ForEach-Object { Write-Host $_ }
@@ -213,7 +196,7 @@ jobs:
         run: |
           $ip = $env:TAILSCALE_IP
           $user = $env:RDP_USER
-          $file = "$env:GITHUB_WORKSPACE\rdp-access-${GITHUB_RUN_ID}.rdp"
+          $file = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath "rdp-access-${env:GITHUB_RUN_ID}.rdp"
 
           $rdpContent = @"
 full address:s:$ip:3389
@@ -227,13 +210,12 @@ enablecredsspsupport:i:0
           Write-Host "Created RDP file at: $file"
           echo "RDP_FILE=$file" >> $env:GITHUB_ENV
 
-          $readme = "$env:GITHUB_WORKSPACE/README-RDP.txt"
+          $readme = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath "README-RDP.txt"
           @"
 Tailscale IP: $ip
 Username: $user
-(Password masked in logs. Use secret/outputs or check Actions mask)
 Ports opened: $env:PORTS
-RDP file: rdp-access-${GITHUB_RUN_ID}.rdp
+RDP file: rdp-access-${env:GITHUB_RUN_ID}.rdp
 "@ | Out-File -FilePath $readme -Encoding UTF8
 
       - name: Upload RDP file & README as artifact
@@ -241,8 +223,8 @@ RDP file: rdp-access-${GITHUB_RUN_ID}.rdp
         with:
           name: rdp-access-${{ github.run_id }}
           path: |
-            ./${{ github.workspace }}/rdp-access-${{ github.run_id }}.rdp
-            ./${{ github.workspace }}/README-RDP.txt
+            ${{ github.workspace }}/rdp-access-${{ github.run_id }}.rdp
+            ${{ github.workspace }}/README-RDP.txt
 
       - name: Final output & keepalive
         shell: pwsh
@@ -250,12 +232,11 @@ RDP file: rdp-access-${GITHUB_RUN_ID}.rdp
           Write-Host "`n=== READY ==="
           Write-Host "Tailscale IP : $env:TAILSCALE_IP"
           Write-Host "Username     : $env:RDP_USER"
-          Write-Host "Password     : (masked in logs) - see workflow masked output"
-          Write-Host "Artifact     : rdp-access-${GITHUB_RUN_ID}.rdp (download from workflow artifacts)"
+          Write-Host "Password     : (masked in logs)"
+          Write-Host "Artifact     : rdp-access-${GITHUB_RUN_ID}.rdp"
           Write-Host "Ports        : $env:PORTS"
           Write-Host "================`n"
 
-          # Keep alive (finite heartbeats so workflow doesn't look like stuck)
           for ($i=0; $i -lt 120; $i++) {
             Write-Host "[$(Get-Date)] Session active - will auto-check status every 60s. Stop workflow to terminate."
             Start-Sleep -Seconds 60
