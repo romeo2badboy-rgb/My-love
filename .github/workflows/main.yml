@@ -1,5 +1,4 @@
-name: Enhanced RDP
-
+name: RDPon - Hardened & Multi-Port
 on:
   workflow_dispatch:
 
@@ -8,423 +7,257 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 3600
 
+    env:
+      # Ports we will open + verify
+      PORTS: "3389,3822,80,443"
+      TAILSCALE_MSI_URL: "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+      RDP_USERNAME: "RDP"
+
     steps:
-      - name: Configure Enhanced RDP Settings
+      - name: Prepare - show env
+        run: echo "Preparing to open ports: $env:PORTS"
+        shell: pwsh
+
+      - name: Configure RDP, Services & Firewall (robust)
+        shell: pwsh
         run: |
-          # Enable Remote Desktop and configure security
+          $enableNLA = $env:ENABLE_NLA -eq "true"  # optional secret ENABLE_NLA=true to enable NLA
+          Write-Host "Enable NLA? $enableNLA"
+
+          # Enable Remote Desktop (allow connections)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 1 -Force
 
-          # Remove existing firewall rules to avoid conflicts
-          $ports = @(3389, 80, 443, 3822)
-          foreach ($port in $ports) {
-              netsh advfirewall firewall delete rule name="Enhanced-Port-$port" 2>$null
+          if ($enableNLA) {
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+            # keep SecurityLayer default (0 = RDP, 1 = Negotiate, 2 = SSL)
+          } else {
+            # Disable NLA to maximize compatibility with simple RDP clients
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           }
-          
-          # Add firewall rules for all required ports
-          netsh advfirewall firewall add rule name="Enhanced-Port-3389" dir=in action=allow protocol=TCP localport=3389
-          netsh advfirewall firewall add rule name="Enhanced-Port-80" dir=in action=allow protocol=TCP localport=80
-          netsh advfirewall firewall add rule name="Enhanced-Port-443" dir=in action=allow protocol=TCP localport=443
-          netsh advfirewall firewall add rule name="Enhanced-Port-3822" dir=in action=allow protocol=TCP localport=3822
 
-          # Restart Terminal Service
-          Restart-Service -Name TermService -Force
-          Write-Host "RDP configured with ports: 3389, 80, 443, 3822"
+          # Ensure TermService is set to Automatic and running
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
 
-      - name: Create Enhanced RDP User
+          # Firewall rules: remove old named rules then add robust rules on all profiles
+          $ruleBase = "GH-RDPon-Rule"
+          Get-NetFirewallRule -DisplayName "$ruleBase-*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+
+          $ports = $env:PORTS.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+          foreach ($p in $ports) {
+            # Add both TCP allow and ensure applied to All profiles (Domain,Private,Public)
+            if (-not (Get-NetFirewallRule -DisplayName "$ruleBase-$p" -ErrorAction SilentlyContinue)) {
+              New-NetFirewallRule -DisplayName "$ruleBase-$p" -Direction Inbound -LocalPort $p -Protocol TCP -Action Allow -Profile Any -Enabled True
+            } else {
+              Write-Host "Firewall rule for port $p already exists."
+            }
+          }
+
+          # Diagnostics dump
+          Write-Host "=== LISTENERS (netstat) ==="
+          netstat -an | Select-String ":3389|:3822|:80|:443" | ForEach-Object { Write-Host $_ }
+
+          Write-Host "=== CURRENT RDP LISTENER STATUS ==="
+          Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue | Format-Table -AutoSize
+
+      - name: Create local user with strong password (masked)
+        shell: pwsh
         run: |
-          # Generate strong password
           Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = [char[]]('!@#$%^&*()_+-=[]{}|;:,.<>?'.ToCharArray())
+            Upper   = [char[]](65..90)
+            Lower   = [char[]](97..122)
+            Number  = [char[]](48..57)
+            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           }
-          
-          # Create 20-character password
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 5
-          $rawPassword += $charSet.Lower | Get-Random -Count 5
-          $rawPassword += $charSet.Number | Get-Random -Count 5
-          $rawPassword += $charSet.Special | Get-Random -Count 5
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          
-          # Create user account
+
+          $raw = @()
+          $raw += $charSet.Upper | Get-Random -Count 4
+          $raw += $charSet.Lower | Get-Random -Count 4
+          $raw += $charSet.Number | Get-Random -Count 4
+          $raw += $charSet.Special | Get-Random -Count 4
+          $password = -join ($raw | Sort-Object { Get-Random })
+
+          # Mask the password in Actions logs
+          Write-Host "::add-mask::$password"
+
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDPAdmin" -Password $securePass -AccountNeverExpires -Description "Enhanced RDP Access Account"
-          Add-LocalGroupMember -Group "Administrators" -Member "RDPAdmin"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPAdmin"
-          Add-LocalGroupMember -Group "Users" -Member "RDPAdmin"
-          
-          # Store credentials
-          echo "RDP_USERNAME=RDPAdmin" >> $env:GITHUB_ENV
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          
-          # Verify user creation
-          if (-not (Get-LocalUser -Name "RDPAdmin")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
-          Write-Host "Enhanced user 'RDPAdmin' created successfully"
 
-      - name: Install Tailscale
+          if (Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue) {
+            Write-Host "User $($env:RDP_USERNAME) already exists. Resetting password and ensuring groups."
+            Set-LocalUser -Name $env:RDP_USERNAME -Password $securePass
+          } else {
+            Write-Host "Creating user $($env:RDP_USERNAME)"
+            New-LocalUser -Name $env:RDP_USERNAME -Password $securePass -AccountNeverExpires -UserMayNotChangePassword:$false
+          }
+
+          # Add to needed groups
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+
+          # Export creds to GITHUB_ENV for later steps (masked)
+          echo "RDP_USER=$env:RDP_USERNAME" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale (robust download + install)
+        shell: pwsh
         run: |
-          # Download and install Tailscale
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Write-Host "Downloading Tailscale..."
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          
+          $installer = "$env:TEMP\tailscale.msi"
+          Write-Host "Downloading Tailscale from $env:TAILSCALE_MSI_URL..."
+          Invoke-WebRequest -Uri $env:TAILSCALE_MSI_URL -OutFile $installer -UseBasicParsing -ErrorAction Stop
           Write-Host "Installing Tailscale..."
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-          Write-Host "Tailscale installed successfully"
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          Write-Host "Tailscale installed. Version:"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" version
 
-      - name: Establish Tailscale Connection
+      - name: Connect Tailscale and wait for IP
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          # Validate Tailscale auth key first
-          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
-          if ([string]::IsNullOrEmpty($authKey) -or $authKey -eq "" -or $authKey.Length -lt 20) {
-              Write-Host "❌ TAILSCALE_AUTH_KEY is missing or invalid!"
-              Write-Host ""
-              Write-Host "🔧 How to fix this:"
-              Write-Host "1. Go to Tailscale Admin Console: https://login.tailscale.com/admin/settings/keys"
-              Write-Host "2. Generate a new Auth Key with these settings:"
-              Write-Host "   - Reusable: ✅ Enabled"
-              Write-Host "   - Ephemeral: ✅ Enabled (recommended for temporary servers)"
-              Write-Host "   - Preauthorized: ✅ Enabled"
-              Write-Host "   - Tags: Optional (e.g., tag:github-actions)"
-              Write-Host "3. Copy the generated key (starts with 'tskey-auth-')"
-              Write-Host "4. In GitHub repo: Settings > Secrets and variables > Actions"
-              Write-Host "5. Create new secret: Name=TAILSCALE_AUTH_KEY, Value=your_key"
-              Write-Host ""
-              Write-Host "⚠️ Auth key format should be: tskey-auth-xxxxxxxxxxxxxxxxx"
-              Write-Host "❌ Current key: $($authKey.Substring(0, [Math]::Min(10, $authKey.Length)))..."
-              exit 1
+          if (-not $env:TAILSCALE_AUTH_KEY) {
+            Write-Error "Missing secret: TAILSCALE_AUTH_KEY"
+            exit 1
           }
-          
-          # Connect to Tailscale with unique hostname
-          $hostname = "enhanced-rdp-$env:GITHUB_RUN_ID"
-          Write-Host "🔗 Connecting to Tailscale with hostname: $hostname"
-          Write-Host "🔑 Using auth key: $($authKey.Substring(0, 15))..."
-          
-          try {
-              $connectResult = & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="$authKey" --hostname="$hostname" --accept-routes 2>&1
-              
-              if ($LASTEXITCODE -ne 0) {
-                  Write-Host "❌ Tailscale connection failed with exit code: $LASTEXITCODE"
-                  Write-Host "Error output: $connectResult"
-                  
-                  if ($connectResult -match "invalid key|not valid|expired") {
-                      Write-Host ""
-                      Write-Host "🔧 Auth Key Issues - Possible solutions:"
-                      Write-Host "1. Key expired - Generate a new one"
-                      Write-Host "2. Key already used (if not reusable) - Generate new reusable key"
-                      Write-Host "3. Key format wrong - Should start with 'tskey-auth-'"
-                      Write-Host "4. Key has restricted permissions - Check key settings"
-                  }
-                  exit 1
-              }
-              
-              Write-Host "✅ Successfully connected to Tailscale network"
-          } catch {
-              Write-Host "❌ Connection error: $_"
-              exit 1
-          }
-          
-          # Wait for IP assignment with better retry logic
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) { Write-Error "Tailscale executable not found at $exe"; exit 1 }
+
+          # Up with authkey and unique hostname
+          & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes --accept-dns=false
+
+          # robust wait for IPv4 address
           $tsIP = $null
           $retries = 0
-          $maxRetries = 20
-          
-          Write-Host "⏳ Waiting for Tailscale IP assignment..."
-          while (-not $tsIP -and $retries -lt $maxRetries) {
-              try {
-                  $ipOutput = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
-                  if ($ipOutput -and $ipOutput -match '^\d+\.\d+\.\d+\.\d+$') {
-                      $tsIP = $ipOutput.Trim()
-                      break
-                  }
-              } catch {
-                  Write-Host "." -NoNewline
-              }
-              
+          while (-not $tsIP -and $retries -lt 20) {
+            $ipsRaw = & $exe ip -4 2>$null
+            # take first non-empty line and first token
+            $ips = ($ipsRaw -split "\r?\n" | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' })
+            if ($ips.Count -gt 0) {
+              $tsIP = ($ips[0] -split '\s+')[0].Trim()
+            }
+            if (-not $tsIP) {
               Start-Sleep -Seconds 3
               $retries++
-              
-              if ($retries -eq 5) { Write-Host "`n🔄 Still waiting for IP assignment..." }
-              if ($retries -eq 10) { Write-Host "🔄 This might take a moment..." }
-              if ($retries -eq 15) { 
-                  Write-Host "🔄 Checking Tailscale status..."
-                  try {
-                      & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-                  } catch {
-                      Write-Host "Could not get status"
-                  }
-              }
+            }
           }
-          
+
           if (-not $tsIP) {
-              Write-Host "❌ Tailscale IP not assigned after $maxRetries attempts"
-              Write-Host "🔧 Debugging info:"
-              try {
-                  Write-Host "Tailscale Status:"
-                  & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>&1
-                  Write-Host "Network interfaces:"
-                  Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object Name, LinkSpeed
-              } catch {
-                  Write-Host "Could not retrieve debug info"
-              }
-              exit 1
+            Write-Error "Tailscale IP not assigned after retries. Dumping status and exiting."
+            & $exe status || Write-Host "tailscale status failed"
+            exit 1
           }
-          
+
+          Write-Host "TAILSCALE_IP=$tsIP"
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          echo "TAILSCALE_HOSTNAME=$hostname" >> $env:GITHUB_ENV
-          Write-Host "🎯 Tailscale IP assigned: $tsIP"
 
-      - name: Verify Enhanced Connectivity
+      - name: Local & Remote Port Checks (listen + connectivity)
+        shell: pwsh
         run: |
-          $tsIP = $env:TAILSCALE_IP
-          $portsToTest = @(3389, 80, 443, 3822)
-          
-          Write-Host "Testing connectivity to $tsIP"
-          Write-Host "Testing ports: $($portsToTest -join ', ')"
-          
-          foreach ($port in $portsToTest) {
-              Write-Host "Testing port $port..." -NoNewline
-              try {
-                  $testResult = Test-NetConnection -ComputerName $tsIP -Port $port -WarningAction SilentlyContinue
-                  if ($testResult.TcpTestSucceeded) {
-                      Write-Host " SUCCESS" -ForegroundColor Green
-                  } else {
-                      Write-Host " FAILED" -ForegroundColor Yellow
-                  }
-              } catch {
-                  Write-Host " ERROR" -ForegroundColor Red
-              }
+          $ports = $env:PORTS.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+          $allGood = $true
+
+          # 1) Check local listen on 3389 specifically
+          $listen = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          if ($null -eq $listen) {
+            Write-Warning "RDP service is not listening on local port 3389. Attempting to restart TermService and re-check..."
+            Restart-Service -Name TermService -Force
+            Start-Sleep -Seconds 4
+            $listen = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+            if ($null -eq $listen) {
+              Write-Error "Local listener on 3389 not found after restart. This will likely block remote RDP."
+              $allGood = $false
+            } else {
+              Write-Host "Local listener on 3389 is present after restart."
+            }
+          } else {
+            Write-Host "Local RDP listener OK."
           }
-          
-          # Verify core services
-          $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
-          $tailscaleService = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
-          
-          Write-Host "RDP Service: $(if ($rdpService.Status -eq 'Running') {'Running'} else {'Not Running'})"
-          Write-Host "Tailscale Service: $(if ($tailscaleService.Status -eq 'Running') {'Running'} else {'Not Running'})"
 
-      - name: Display Enhanced Connection Info
-        run: |
-          Write-Host ""
-          Write-Host "==============================================="
-          Write-Host "         ENHANCED RDP SERVER READY"
-          Write-Host "==============================================="
-          Write-Host ""
-          Write-Host "Server Address: $env:TAILSCALE_IP"
-          Write-Host "Username:       RDPAdmin"
-          Write-Host "Password:       $env:RDP_PASSWORD"
-          Write-Host "Hostname:       $env:TAILSCALE_HOSTNAME"
-          Write-Host ""
-          Write-Host "Available Ports:"
-          Write-Host "  - 3389 (RDP)"
-          Write-Host "  - 80   (HTTP)"
-          Write-Host "  - 443  (HTTPS)"
-          Write-Host "  - 3822 (Custom)"
-          Write-Host ""
-          Write-Host "Session Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
-          Write-Host "Max Duration: 60 hours"
-          Write-Host ""
-          Write-Host "==============================================="
+          # 2) From runner -> Tailscale IP check each port (TCP)
+          $remote = $env:TAILSCALE_IP
+          if (-not $remote) { Write-Error "No Tailscale IP set"; exit 1 }
 
-      - name: Maintain Enhanced Session
-        run: |
-          Write-Host "Enhanced RDP session is now active!"
-          Write-Host "Use 'Cancel workflow' in GitHub Actions to terminate"
-          Write-Host ""
-          
-          $startTime = Get-Date
-          $logInterval = 300  # 5 minutes
-          $statusInterval = 60  # 1 minute
-          $lastDetailedLog = Get-Date
-          
-          while ($true) {
-              $currentTime = Get-Date
-              $elapsed = [math]::Round(($currentTime - $startTime).TotalMinutes, 1)
-              
-              # Show detailed status every 5 minutes
-              if (($currentTime - $lastDetailedLog).TotalSeconds -ge $logInterval) {
-                  Write-Host ""
-                  Write-Host "=== SESSION STATUS UPDATE ==="
-                  Write-Host "Elapsed Time: $elapsed minutes"
-                  Write-Host "Server IP: $env:TAILSCALE_IP"
-                  Write-Host "Status: ACTIVE"
-                  Write-Host "Time: $(Get-Date -Format 'HH:mm:ss')"
-                  
-                  # Quick service check
-                  $rdpSvc = Get-Service -Name TermService -ErrorAction SilentlyContinue
-                  $tsSvc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
-                  Write-Host "RDP Service: $(if ($rdpSvc.Status -eq 'Running') {'OK'} else {'ISSUE'})"
-                  Write-Host "Tailscale: $(if ($tsSvc.Status -eq 'Running') {'OK'} else {'ISSUE'})"
-                  Write-Host "============================="
-                  
-                  $lastDetailedLog = $currentTime
-              } else {
-                  # Brief status update
-                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Enhanced RDP Active | $elapsed min elapsed | Server: $env:TAILSCALE_IP"
-              }
-              
-              Start-Sleep -Seconds $statusInterval
-          }          
-          # Verify user creation
-          if (-not (Get-LocalUser -Name "RDPAdmin")) {
-              Write-Error "User creation failed"
-              exit 1
+          foreach ($p in $ports) {
+            $ok = $false
+            # run Test-NetConnection with timeout attempts
+            for ($i=0; $i -lt 6; $i++) {
+              $t = Test-NetConnection -ComputerName $remote -Port $p -InformationLevel Detailed -WarningAction SilentlyContinue
+              if ($t.TcpTestSucceeded) { $ok = $true; break }
+              Start-Sleep -Seconds 3
+            }
+            if ($ok) {
+              Write-Host "✅ Remote port $p reachable on $remote"
+            } else {
+              Write-Warning "❌ Remote port $p NOT reachable on $remote"
+              $allGood = $false
+            }
           }
-          Write-Host "Enhanced user 'RDPAdmin' created successfully"
 
-      - name: Install Tailscale
-        run: |
-          # Download and install Tailscale
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Write-Host "Downloading Tailscale..."
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          
-          Write-Host "Installing Tailscale..."
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-          Write-Host "Tailscale installed successfully"
-
-      - name: Establish Tailscale Connection
-        run: |
-          # Connect to Tailscale with unique hostname
-          $hostname = "enhanced-rdp-$env:GITHUB_RUN_ID"
-          Write-Host "Connecting to Tailscale with hostname: $hostname"
-          
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname --accept-routes
-          
-          # Wait for IP assignment with better retry logic
-          $tsIP = $null
-          $retries = 0
-          $maxRetries = 15
-          
-          Write-Host "Waiting for Tailscale IP assignment..."
-          while (-not $tsIP -and $retries -lt $maxRetries) {
-              try {
-                  $ipOutput = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
-                  if ($ipOutput -and $ipOutput -match '^\d+\.\d+\.\d+\.\d+$') {
-                      $tsIP = $ipOutput.Trim()
-                  }
-              } catch {
-                  Write-Host "." -NoNewline
-              }
-              
-              if (-not $tsIP) {
-                  Start-Sleep -Seconds 3
-                  $retries++
-                  if ($retries -eq 5) { Write-Host "`nStill waiting..." }
-              }
+          if (-not $allGood) {
+            Write-Error "One or more checks failed. See logs above for diagnostics. Exiting with failure to avoid exposing a broken endpoint."
+            # Provide quick diagnostics
+            Write-Host "`n--- DIAGNOSTICS ---"
+            Write-Host "Local netstat:"
+            netstat -an | Select-String ":3389|:3822|:80|:443" | ForEach-Object { Write-Host $_ }
+            Write-Host "`nRDP listener details:"
+            Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue | Format-Table -AutoSize
+            Write-Host "`nFirewall rules:"
+            Get-NetFirewallRule -DisplayName "GH-RDPon-*" | Format-Table DisplayName,Enabled,Direction,Profile -AutoSize
+            exit 1
           }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned after $maxRetries attempts"
-              exit 1
-          }
-          
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          echo "TAILSCALE_HOSTNAME=$hostname" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP assigned: $tsIP"
 
-      - name: Verify Enhanced Connectivity
+      - name: Create .rdp file (downloadable) and small README
+        shell: pwsh
         run: |
-          $tsIP = $env:TAILSCALE_IP
-          $portsToTest = @(3389, 80, 443, 3822)
-          
-          Write-Host "Testing connectivity to $tsIP"
-          Write-Host "Testing ports: $($portsToTest -join ', ')"
-          
-          foreach ($port in $portsToTest) {
-              Write-Host "Testing port $port..." -NoNewline
-              try {
-                  $testResult = Test-NetConnection -ComputerName $tsIP -Port $port -WarningAction SilentlyContinue
-                  if ($testResult.TcpTestSucceeded) {
-                      Write-Host " SUCCESS" -ForegroundColor Green
-                  } else {
-                      Write-Host " FAILED" -ForegroundColor Yellow
-                  }
-              } catch {
-                  Write-Host " ERROR" -ForegroundColor Red
-              }
-          }
-          
-          # Verify core services
-          $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
-          $tailscaleService = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
-          
-          Write-Host "RDP Service: $(if ($rdpService.Status -eq 'Running') {'Running'} else {'Not Running'})"
-          Write-Host "Tailscale Service: $(if ($tailscaleService.Status -eq 'Running') {'Running'} else {'Not Running'})"
+          $ip = $env:TAILSCALE_IP
+          $user = $env:RDP_USER
+          $file = "$env:GITHUB_WORKSPACE\rdp-access-${GITHUB_RUN_ID}.rdp"
 
-      - name: Display Enhanced Connection Info
-        run: |
-          Write-Host ""
-          Write-Host "==============================================="
-          Write-Host "         ENHANCED RDP SERVER READY"
-          Write-Host "==============================================="
-          Write-Host ""
-          Write-Host "Server Address: $env:TAILSCALE_IP"
-          Write-Host "Username:       RDPAdmin"
-          Write-Host "Password:       $env:RDP_PASSWORD"
-          Write-Host "Hostname:       $env:TAILSCALE_HOSTNAME"
-          Write-Host ""
-          Write-Host "Available Ports:"
-          Write-Host "  - 3389 (RDP)"
-          Write-Host "  - 80   (HTTP)"
-          Write-Host "  - 443  (HTTPS)"
-          Write-Host "  - 3822 (Custom)"
-          Write-Host ""
-          Write-Host "Session Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
-          Write-Host "Max Duration: 60 hours"
-          Write-Host ""
-          Write-Host "==============================================="
+          $rdpContent = @"
+full address:s:$ip:3389
+username:s:$user
+prompt for credentials:i:1
+authentication level:i:0
+enablecredsspsupport:i:0
+"@
 
-      - name: Maintain Enhanced Session
+          $rdpContent | Out-File -FilePath $file -Encoding ASCII
+          Write-Host "Created RDP file at: $file"
+          echo "RDP_FILE=$file" >> $env:GITHUB_ENV
+
+          $readme = "$env:GITHUB_WORKSPACE/README-RDP.txt"
+          @"
+Tailscale IP: $ip
+Username: $user
+(Password masked in logs. Use secret/outputs or check Actions mask)
+Ports opened: $env:PORTS
+RDP file: rdp-access-${GITHUB_RUN_ID}.rdp
+"@ | Out-File -FilePath $readme -Encoding UTF8
+
+      - name: Upload RDP file & README as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-access-${{ github.run_id }}
+          path: |
+            ./${{ github.workspace }}/rdp-access-${{ github.run_id }}.rdp
+            ./${{ github.workspace }}/README-RDP.txt
+
+      - name: Final output & keepalive
+        shell: pwsh
         run: |
-          Write-Host "Enhanced RDP session is now active!"
-          Write-Host "Use 'Cancel workflow' in GitHub Actions to terminate"
-          Write-Host ""
-          
-          $startTime = Get-Date
-          $logInterval = 300  # 5 minutes
-          $statusInterval = 60  # 1 minute
-          $lastDetailedLog = Get-Date
-          
-          while ($true) {
-              $currentTime = Get-Date
-              $elapsed = [math]::Round(($currentTime - $startTime).TotalMinutes, 1)
-              
-              # Show detailed status every 5 minutes
-              if (($currentTime - $lastDetailedLog).TotalSeconds -ge $logInterval) {
-                  Write-Host ""
-                  Write-Host "=== SESSION STATUS UPDATE ==="
-                  Write-Host "Elapsed Time: $elapsed minutes"
-                  Write-Host "Server IP: $env:TAILSCALE_IP"
-                  Write-Host "Status: ACTIVE"
-                  Write-Host "Time: $(Get-Date -Format 'HH:mm:ss')"
-                  
-                  # Quick service check
-                  $rdpSvc = Get-Service -Name TermService -ErrorAction SilentlyContinue
-                  $tsSvc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
-                  Write-Host "RDP Service: $(if ($rdpSvc.Status -eq 'Running') {'OK'} else {'ISSUE'})"
-                  Write-Host "Tailscale: $(if ($tsSvc.Status -eq 'Running') {'OK'} else {'ISSUE'})"
-                  Write-Host "============================="
-                  
-                  $lastDetailedLog = $currentTime
-              } else {
-                  # Brief status update
-                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Enhanced RDP Active | $elapsed min elapsed | Server: $env:TAILSCALE_IP"
-              }
-              
-              Start-Sleep -Seconds $statusInterval
+          Write-Host "`n=== READY ==="
+          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host "Username     : $env:RDP_USER"
+          Write-Host "Password     : (masked in logs) - see workflow masked output"
+          Write-Host "Artifact     : rdp-access-${GITHUB_RUN_ID}.rdp (download from workflow artifacts)"
+          Write-Host "Ports        : $env:PORTS"
+          Write-Host "================`n"
+
+          # Keep alive (finite heartbeats so workflow doesn't look like stuck)
+          for ($i=0; $i -lt 120; $i++) {
+            Write-Host "[$(Get-Date)] Session active - will auto-check status every 60s. Stop workflow to terminate."
+            Start-Sleep -Seconds 60
           }
+          Write-Host "Keepalive finished; exiting."
